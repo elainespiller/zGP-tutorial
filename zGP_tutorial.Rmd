@@ -1,0 +1,196 @@
+---
+title: "zGP tutorial for VICTOR"
+output: html_document
+date: "2024-08-15"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+This code was written by Elaine Spiller and adapted by Josh Seidamn. The implements the algorithms introduced in The Zero Problem: Gaussian Process Emulators for Range-Constrained Computer Models (Spiller, Wolpert, Tierz, Asher, 2023).
+
+Here we develop Gaussian process (GP) surrogates for model data whose output is positive or zero. This is exactly the case we often have for volcanic flow model data. That is, some training runs result in no flow at a given location while others output a positive inundation depth at that location. 
+
+The primary idea is to impute "negative output" for training runs resulting in zeros that is consistent with GPs fit only to the positive-output training data. The zGP is a pre-processing step. Once negative outputs are imputed, any "standard" GP packages can be applied.
+
+First, we'll need to call necessary libraries used in constructing the zGP. In particular, we use the RobustGaSP package for fitting GPs (this could be swapped out for other GP-fitting codes.) These will need to be installed with install.packages() prior to running this notebook.
+
+library("MASS")
+library("R.matlab")
+library("RobustGaSP")
+library("plotly")
+library("profvis")
+library("mgcv")
+library("Rcpp")
+```{r libararies, include=FALSE}
+library("MASS")
+library("R.matlab")
+library("RobustGaSP")
+library("plotly")
+library("profvis")
+library("mgcv")
+library("Rcpp")
+```
+Here we'll walk through applying the zGP to an example where our "data" comes from is a complicated, nonlinear function of two inputs. (This toy function is adapted from Kennedy and O'Hagan (2012).)
+\[
+f(x_1, x_2)=\max\Big{[}\big{(}1-\exp(-\frac{1}{2x_2})\big{)}\Big{(}\frac{2300x_1^3+199x_1^2+2092x_1+60}{100x_1^3+500x_1^2+4x_1+20 }\Big{)}-6, 0 \Big{]}
+\]
+with $0 \leq x_1, x_2 \leq 1$. 
+
+```{r, load data}
+setwd('/Users/elainespiller/Downloads/zGP-main-R/') #need to change this path on VICTOR
+rm(list = ls())
+s = Sys.time()
+set.seed(6)
+
+xdsave = readMat('BO_toy_design.mat')$xdsave # you could pick these random -- typically that happens with Latin Hypercube sampling, which you can basically think of as uniform sampling
+
+BO_toy = function(x,y) (1-exp(-1/(2*y)))*(2300*x^3+199*x^2+2092*x+60)/(100*x^3+500*x^2+4*x+20)-6
+
+y = matrix(BO_toy(xdsave[,1], xdsave[,2]))
+xd = xdsave
+ytrue = y
+```
+
+
+
+This next part identifies the zero-output training data.
+```{r, identify zeros}
+Nd = dim(xdsave)[1]
+Npars = dim(xd)[2]
+
+yimp = y
+inds = which(y <= 0)
+yimp[inds] = 0
+ystart = yimp
+```
+
+
+
+To impute negative output in place of zero outputs, we need to start with negative samples. This next part does "batch sampling" to get an initial set of negative samples for the zero-output responses.
+```{r, initialize zGP, echo=T, results='hide'}
+source("./RLW_init_impute.R")
+source("./corr_matrix.R")
+
+output = RLW_init_impute(xd, ystart) # This does "batch sampling" to get an initially set of negative samples
+yimputesave = output[[1]]
+sigsp = output[[2]]
+yimp = matrix(apply(yimputesave, MARGIN = 1, FUN = median))
+```
+This next  bit is all to arrange order of the design to have [positive outputs, "closest zeros" in design space]; 
+this is what gets fed into zGP_gibbs_nrz_optmean.R. "Closest zeros" are those that are near (in input space) a non-zero training run and those have a small probability of a negative response as predicted by a GP only fit to positive-output training data.
+```{r, identify closest zeros, echo=T, results='hide'}
+y = yimp
+N = length(y)
+indsp = which(y > 0)
+indsz = which(y <= 0)
+yp = y[indsp,,drop=F]
+Np = length(indsp)
+xdp = xd[indsp,]
+yn = y[indsz,,drop=F]
+Nz = length(indsz)
+xdn = xd[indsz,]
+yRL = matrix(apply(yimputesave, MARGIN = 1, FUN = median))
+distnp = matrix(0, nrow = Nz, ncol = Np)
+
+source("./probs_zeros.R")
+output = probs_zeros(Nz, Np, xdp, yp, xdn, yRL, indsp, indsz)
+xall = output[[1]]
+yall = output[[2]]
+Ninclude = output[[3]]
+ppgasp_options = output[[4]]
+erf = output[[5]]
+erfinv = output[[6]]
+```
+This next part implements the core of the zGP algorithm by imputing negative responses to design points that have zero outputs. The zGP_gibbs_nrz_optmean() takes the initial set of negative samples and refines them with Gibbs sampling.
+output{1} is set of Gibbs sampling for all y while output{2} are (square of the) range parameters. The last part below re-orders the data to the original order.
+
+The variable yzgp is the primary result of this algorithm and contains the imputed samples. They are taken as the mean of the thinned imputed samples (after burn-in samples are discarded).
+```{r, implementing zGP, echo=T, results='hide'}
+Ngibbs = 2000
+source("./zGP_gibbs_nrz_optmean.R")
+
+locs = matrix(0, nrow = 1, ncol = 2) # specific when an input is vent opening location, so that the GP can be regressed around distance to the vent
+
+output = zGP_gibbs_nrz_optmean(xall,yall,Ngibbs,locs, Ninclude); # This takes the initial set of negative samples and refines them with Gibbs sampling
+                                                                  # output{1} is set of Gibbs samples for all y
+                                                                  # output{2} are (square of) range parameter
+                                                                 
+temp = output[[1]]
+for (kk in 1:dim(xd)[1]){
+  inds[kk] = which(apply(xall, 1, function(row) all(row == xd[kk, ])))
+}
+yzgp = matrix(rowMeans(temp[inds,seq(1001,ncol(temp), by = 5)]))
+
+ppgasp_options$trend = cbind(matrix(1, nrow = N, ncol = 1), xd)
+
+modelzgp = ppgasp(design = xd, response = yzgp,
+                  trend = ppgasp_options$trend,
+                  zero.mean = ppgasp_options$zero.mean,
+                  nugget.est = ppgasp_options$nugget.est)
+```
+
+The original toy function with the design.
+```{r, plotting}
+
+x = seq(0, 1, by = 0.01)
+y = seq(0, 1, by = 0.01)
+grid = expand.grid(x = x, y = y)
+z = with(grid, pmax(BO_toy(grid$x, grid$y), 0))
+xx <- matrix(grid$x, nrow = length(x), ncol = length(y), byrow = TRUE)
+yy <- matrix(grid$y, nrow = length(x), ncol = length(y), byrow = TRUE)
+Ngrid = length(x)
+NN = Ngrid*Ngrid
+
+xd = xdsave
+
+plot_ly() %>%
+  add_surface(x = x, y = y, z = matrix(z, nrow = length(x), ncol = length(y), byrow = TRUE), alpha = 0.5) %>%
+  add_markers(x = xd[,1], y = xd[,2], z = ystart[,])%>%
+  layout(title = 'True BO_toy surface with training design') %>%
+  layout(scene = list(aspectmode = "manual", aspectratio = list(x=1,y=1,z=0.5)))
+```
+The predictive surface using the zGP. Note, the GP is fit to the imputed yzgp training data. The model response surface is the maximum of the predicted surface and the mean.
+```{r}
+yyr = matrix(yy, ncol = 1)
+xxr = matrix(xx, ncol = 1)
+xyr = cbind(xxr, yyr)
+
+ppgasp_options$testing.trend = cbind(matrix(1, nrow = NN, ncol = 1), xyr)
+
+pred_model = predict.ppgasp(modelzgp, xyr,
+                            testing_trend = ppgasp_options$testing.trend)
+pmean = pred_model$mean
+
+inds = which(pmean < 0)
+pmean[inds] = 0
+pmean = matrix(pmean, nrow = Ngrid, ncol = Ngrid)
+
+plot_ly(x = x, y = y, z = pmean, type = "surface", alpha = 0.5) %>%
+  add_markers(x = xd[,1], y = xd[,2], z = ystart[,])%>%
+  layout(title = 'zGP predicted surface with (original) training data') %>%
+  layout(scene = list(aspectmode = "manual", aspectratio = list(x=1,y=1,z=0.5)))
+```
+A top-down view of the difference between the predicted vs the true surface.
+```{r}
+df = data.frame(xxr, yyr)
+df$z = pmax(BO_toy(df$xxr, df$yyr), 0)
+df$estimate = pmax(pred_model$mean,0)
+df$diff = df$z - df$estimate
+
+x_points = xd[,1]
+y_points = xd[,2]
+point_df = data.frame(x_points, y_points)
+
+custom_colors = colorRampPalette(colors = c("blue", "turquoise", "orange", "yellow"))(100)
+
+ggplot() + 
+  labs(x = "x_1", y = "x_2", fill = "difference betweeen prediction and truth") +
+  geom_tile(data = df, aes(x = xxr, y = yyr, fill = diff)) +
+  scale_fill_gradientn(colors = custom_colors) +
+  geom_point(data = point_df, aes(x = x_points, y = y_points), color = "black") +
+  theme_bw()
+
+#print(Sys.time()-s)
+
+```

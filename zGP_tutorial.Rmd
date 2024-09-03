@@ -38,7 +38,7 @@ f(x_1, x_2)=\max\Big{[}\big{(}1-\exp(-\frac{1}{2x_2})\big{)}\Big{(}\frac{2300x_1
 with $0 \leq x_1, x_2 \leq 1$. 
 
 ```{r, load data}
-setwd('/Users/elainespiller/Downloads/zGP-main-R/') #need to change this path on VICTOR
+setwd('/Users/elainespiller/Downloads/zGP-main-R/') #need to change this path on your computer
 rm(list = ls())
 s = Sys.time()
 set.seed(6)
